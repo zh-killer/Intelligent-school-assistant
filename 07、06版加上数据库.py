@@ -1,5 +1,7 @@
 import json
 import os
+import sys
+import io
 import gradio as gr
 import requests
 from langchain.agents import create_agent
@@ -18,9 +20,28 @@ from bs4 import BeautifulSoup
 from html import escape as html_escape
 import base64
 import uuid
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None  # OpenCV 是可选依赖（仅拍照+YOLO标注图需要）
 from io import BytesIO
 from PIL import Image
+
+# ====================== 环境初始化 ======================
+# 自动加载 .env 文件（优先级高于系统环境变量）
+try:
+    from dotenv import load_dotenv
+    _env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    load_dotenv(_env_file)
+    if os.path.exists(_env_file):
+        print(f"[配置] 已加载 {_env_file}")
+except ImportError:
+    pass  # python-dotenv 未安装时忽略，用户可以手动设环境变量
+
+# 修复 Windows GBK 终端打印 emoji 崩溃的问题
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 """
 1.应用langchain开发可以使用的工具(天气、百科、邮件、数据库、联网搜索)
@@ -778,6 +799,8 @@ def get_yolo_info(img_path):
 
 def take_photo():
     """拍照：OpenCV调用摄像头，捕获一帧画面并返回PIL图片"""
+    if cv2 is None:
+        raise gr.Error("OpenCV 未安装，无法使用摄像头。请执行: pip install opencv-python")
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise gr.Error("无法打开摄像头！请检查摄像头是否被其他应用占用")
@@ -1704,11 +1727,67 @@ with gr.Blocks(title="智慧校园系统") as demo:
                  login_error]
     )
 
-if __name__ == "__main__":
+# ====================== 启动前配置检查 ======================
+def check_config():
+    """检查关键配置，返回 (是否可启动, 警告信息列表)"""
+    warnings = []
+    errors = []
+
+    # 智谱 AI（核心，缺了完全不能用）
     if not os.getenv("zhipuai_api_key"):
-        print("⚠️ 警告：未设置 zhipuai_api_key 环境变量")
-        print("请设置：set zhipuai_api_key=your_api_key (Windows)")
-        print("或：export zhipuai_api_key='your_api_key' (Linux/Mac)")
+        errors.append("❌ zhipuai_api_key 未设置 → AI对话、联网搜索、图像识别全部不可用")
+    else:
+        print(f"✅ 智谱AI Key: {os.getenv('zhipuai_api_key')[:8]}***")
+
+    # 高德地图（天气功能需要）
+    if not os.getenv("AMAP_API_KEY"):
+        warnings.append("⚠️ AMAP_API_KEY 未设置 → 天气查询不可用（去 https://console.amap.com/ 免费申请）")
+    else:
+        print(f"✅ 高德地图 Key: {os.getenv('AMAP_API_KEY')[:8]}***")
+
+    # MySQL（数据库、登录、历史记录需要）
+    mysql_pwd = os.getenv("MYSQL_PASSWORD")
+    if not mysql_pwd or mysql_pwd == "your_mysql_password":
+        warnings.append("⚠️ MYSQL_PASSWORD 未设置或为默认值 → 数据库功能不可用（登录/历史记录/学生管理）")
+    else:
+        print(f"✅ MySQL: root@{os.getenv('MYSQL_HOST', 'localhost')}:{os.getenv('MYSQL_PORT', '3306')}")
+
+    # QQ邮箱（可选）
+    mail_user = os.getenv("MAIL_USER")
+    if not mail_user or "your_email" in str(mail_user):
+        warnings.append("💡 MAIL_USER/MAIL_PASS 未设置 → 邮件发送不可用（可选功能）")
+    else:
+        print(f"✅ 邮件: {mail_user}")
+
+    return errors, warnings
+
+
+if __name__ == "__main__":
+    print("\n" + "=" * 55)
+    print("  🏫 智慧校园系统 — 启动检查")
+    print("=" * 55)
+
+    errors, warnings = check_config()
+
+    if errors:
+        print("\n" + "=" * 55)
+        print("  🚫 缺少必要配置，应用无法启动：")
+        for e in errors:
+            print(f"     {e}")
+        print("=" * 55)
+        print("\n💡 解决方法：")
+        print("   1. 复制 .env.example 为 .env")
+        print("   2. 编辑 .env，至少填入 zhipuai_api_key")
+        print("   3. 或者手动设置环境变量（见 README.md）")
+        print(f"   配置文件路径: {os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')}")
+        sys.exit(1)
+
+    has_warnings = bool(warnings)
+    if warnings:
+        print("\n  ⚠️  部分可选功能不可用（不影响核心对话）：")
+        for w in warnings:
+            print(f"     {w}")
+        print()
 
     local_ip = get_local_ip()
 
@@ -1717,43 +1796,26 @@ if __name__ == "__main__":
     init_users_table()
     seed_default_users()
 
-    print("\n" + "=" * 50)
-    print("🚀 智慧校园系统启动中...")
-    print("=" * 50)
-    print(f"📡 本地访问地址: http://127.0.0.1:7860")
-    print(f"📡 局域网访问地址: http://{local_ip}:7860")
-    print("=" * 50)
-    print("🔐 测试账号（存储在MySQL users表）:")
-    print("   admin / admin123")
-    print("   zhangsan / 123456")
-    print("   lisi / 123456")
-    print("   （也可在登录页自行注册新账号）")
-    print("=" * 50)
-    # 启动时自检语音识别依赖，缺了就大声说出来
+    print("\n" + "=" * 55)
+    print("  🚀 智慧校园系统启动中...")
+    print("=" * 55)
+    print(f"  📡 本地访问: http://127.0.0.1:7860")
+    print(f"  📡 局域网访问: http://{local_ip}:7860")
+    print("=" * 55)
+    print("  🔐 测试账号（存储在MySQL users表）:")
+    print("     admin / admin123")
+    print("     zhangsan / 123456")
+    print("     lisi / 123456")
+    print("     （也可在登录页自行注册新账号）")
+    print("=" * 55)
+
+    # 启动时自检语音识别依赖
     try:
         import faster_whisper  # noqa: F401
-        print("🎤 语音识别: faster-whisper 可用（首次使用需加载模型，约10秒）")
+        print("  🎤 语音识别: faster-whisper 可用")
     except ImportError:
-        print("⚠️ 语音识别不可用：当前Python环境未安装 faster-whisper")
-        print("   请在运行本文件的环境执行: pip install faster-whisper zhconv")
-    print("=" * 50)
-    print("💡 功能特点：")
-    print("1. ✅ 支持多会话隔离（不同会话ID具有独立记忆）")
-    print("2. ✅ 支持天气查询、百科搜索、邮件发送")
-    print("3. ✅ 支持数据库操作（查询、添加、修改、删除）")
-    print("4. ✅ 自动将自然语言转换为SQL语句")
-    print("5. ✅ 支持联网搜索（智谱Web Search API，实时新闻）")
-    print("6. ✅ 支持网页抓取与智能总结")
-    print("=" * 50)
-    print("📊 数据库测试示例：")
-    print("1. '查询所有人工智能专业的学生'")
-    print("2. '查询张三的成绩'")
-    print("3. '删除学生谢芳'")
-    print("4. '统计每个专业的学生人数'")
-    print("🌐 联网搜索测试示例：")
-    print("1. '搜索今天的最新科技新闻'")
-    print("2. '帮我查一下ChatGPT最新动态'")
-    print("=" * 50 + "\n")
+        print("  ⚠️ 语音识别不可用: pip install faster-whisper zhconv")
+    print("=" * 55)
 
     try:
         demo.launch(
@@ -1767,7 +1829,7 @@ if __name__ == "__main__":
         )
     except OSError as e:
         if "Address already in use" in str(e):
-            print("\n❌ 端口7860已被占用，尝试使用其他端口...")
+            print("\n⚠️ 端口7860已被占用，尝试使用7861端口...")
             demo.launch(
                 server_name="127.0.0.1",
                 server_port=7861,

@@ -44,54 +44,75 @@
 
 ## 🚀 快速启动
 
-### 1. 环境准备
+### 1. 安装依赖
 ```bash
-# Python 3.10+
-pip install gradio langchain langchain-openai zhipuai pymysql requests beautifulsoup4 opencv-python pillow
+# 核心依赖（必须）
+pip install -r requirements.txt
 
-# 语音识别（可选）
+# 语音识别（可选，免费离线使用）
 pip install faster-whisper zhconv
 
-# 目标检测（可选）
-pip install ultralytics
+# YOLO 目标检测（可选）
+pip install ultralytics torch torchvision
 ```
 
-### 2. 配置环境变量
+### 2. 配置密钥
 ```bash
 # 复制配置模板
 cp .env.example .env
 
-# 编辑 .env 填入真实 API Key
-# 至少需要填写：zhipuai_api_key, AMAP_API_KEY, MYSQL_PASSWORD
+# 编辑 .env，至少填入以下几项：
+#   zhipuai_api_key  — 智谱 AI API Key（必填，去 https://open.bigmodel.cn/ 申请）
+#   AMAP_API_KEY     — 高德地图 Web 服务 Key（天气查询需要，去 https://console.amap.com/ 申请）
+#   MYSQL_PASSWORD   — 你的 MySQL root 密码（数据库功能需要）
 ```
 
-**Windows (CMD):**
-```cmd
-set zhipuai_api_key=你的智谱API密钥
-set zhipuai_base_url=https://open.bigmodel.cn/api/paas/v4
-set AMAP_API_KEY=你的高德地图Key
-set MYSQL_PASSWORD=你的MySQL密码
-```
+> **💡 不需要手动设置环境变量** — 应用启动时会自动加载 `.env` 文件（通过 python-dotenv）。
 
-**Windows (PowerShell):**
-```powershell
-$env:zhipuai_api_key="你的智谱API密钥"
-$env:zhipuai_base_url="https://open.bigmodel.cn/api/paas/v4"
-$env:AMAP_API_KEY="你的高德地图Key"
-$env:MYSQL_PASSWORD="你的MySQL密码"
-```
-
-### 3. 准备数据库
+### 3. 准备 MySQL 数据库
 ```sql
 CREATE DATABASE IF NOT EXISTS db_demo DEFAULT CHARSET utf8mb4;
 ```
-（表结构由应用自动创建，无需手动建表）
+> 表结构（chat_sessions、chat_messages、users、students、scores）由应用自动创建。
 
 ### 4. 启动
 ```bash
 python "07、06版加上数据库.py"
 ```
-浏览器访问 `http://localhost:7860`
+浏览器访问 **http://localhost:7860**，使用内置测试账号登录：
+- `admin` / `admin123`
+- `zhangsan` / `123456`
+- `lisi` / `123456`
+
+---
+
+## ❓ 常见问题
+
+| 问题 | 解决方法 |
+|------|----------|
+| 启动时提示 `zhipuai_api_key 未设置` | 复制 `.env.example` → `.env`，填入真实 API Key |
+| 天气查询不工作 | 去 [高德开放平台](https://console.amap.com/) 申请免费 Key，填入 `AMAP_API_KEY` |
+| 登录/注册/历史记录不工作 | 检查 MySQL 是否启动、`MYSQL_PASSWORD` 是否正确 |
+| 邮件发送失败 | QQ邮箱需开启 SMTP 服务并获取**授权码**（非QQ密码），填入 `MAIL_PASS` |
+| 语音识别不可用 | `pip install faster-whisper zhconv` |
+| Emoji/中文显示乱码 | 应用已自动处理；如仍有问题，启动前执行 `set PYTHONIOENCODING=utf-8` |
+| 端口 7860 被占用 | 应用会自动尝试 7861 端口 |
+
+---
+
+## ⚙️ 环境变量完整列表
+
+| 变量名 | 必填 | 说明 | 申请地址 |
+|--------|------|------|----------|
+| `zhipuai_api_key` | ✅ 是 | 智谱 AI API Key | https://open.bigmodel.cn/ |
+| `zhipuai_base_url` | 否 | 智谱 API 地址 | 默认 `https://open.bigmodel.cn/api/paas/v4` |
+| `AMAP_API_KEY` | 推荐 | 高德地图 Web 服务 Key | https://console.amap.com/ |
+| `MYSQL_HOST` | 否 | MySQL 地址 | 默认 `localhost` |
+| `MYSQL_USER` | 否 | MySQL 用户名 | 默认 `root` |
+| `MYSQL_PASSWORD` | 推荐 | MySQL 密码 | — |
+| `MAIL_USER` | 否 | QQ邮箱地址 | — |
+| `MAIL_PASS` | 否 | QQ邮箱 SMTP 授权码 | QQ邮箱 → 设置 → 账户 → POP3/SMTP |
+| `MAIL_RECEIVER` | 否 | 默认收件人 | — |
 
 ---
 
