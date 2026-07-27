@@ -65,10 +65,48 @@ DB_CONFIG = {
     "charset": "utf8mb4"
 }
 
+# ====================== 简易数据库连接池 ======================
+import threading
+from queue import Queue, Empty
+
+_POOL_SIZE = 5
+_pool = Queue(maxsize=_POOL_SIZE)
+_pool_lock = threading.Lock()
+_pool_created = 0
+
+
+def _create_conn():
+    """创建一条新的数据库连接（自动提交模式）"""
+    conn = pymysql.connect(**DB_CONFIG)
+    conn.autocommit(True)
+    return conn
+
 
 def get_conn():
-    """获取数据库连接"""
-    return pymysql.connect(**DB_CONFIG)
+    """从连接池获取一条数据库连接（池满则新建，用后需调用 return_conn 归还）"""
+    global _pool_created
+    try:
+        return _pool.get(block=False)
+    except Empty:
+        with _pool_lock:
+            if _pool_created < _POOL_SIZE:
+                _pool_created += 1
+                return _create_conn()
+        # 池已满，新建一条临时连接（超出池大小）
+        return _create_conn()
+
+
+def return_conn(conn):
+    """归还连接到池（池满则关闭）"""
+    if conn is None:
+        return
+    try:
+        _pool.put_nowait(conn)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def query_db(sql, params=None):
@@ -97,7 +135,7 @@ def query_db(sql, params=None):
         return f"数据库操作失败：{str(e)}"
     finally:
         cursor.close()
-        conn.close()
+        return_conn(conn)
 
 
 # ====================== 会话历史持久化（MySQL） ======================
@@ -109,7 +147,7 @@ def db_exec(sql, params=None):
         cursor.execute(sql, params or ())
         conn.commit()
         cursor.close()
-        conn.close()
+        return_conn(conn)
         return True
     except Exception as e:
         print(f"[聊天记录] 数据库写入失败: {e}")
@@ -124,7 +162,7 @@ def db_fetch(sql, params=None):
         cursor.execute(sql, params or ())
         rows = cursor.fetchall()
         cursor.close()
-        conn.close()
+        return_conn(conn)
         return rows
     except Exception as e:
         print(f"[聊天记录] 数据库读取失败: {e}")
@@ -218,8 +256,16 @@ def init_users_table():
         username VARCHAR(64) NOT NULL UNIQUE,
         password_hash VARCHAR(128) NOT NULL,
         display_name VARCHAR(64) DEFAULT NULL,
+        role VARCHAR(16) NOT NULL DEFAULT 'user',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     ) DEFAULT CHARSET=utf8mb4""")
+    # 老版本建的表没有role列 → 自动补上
+    has_col = db_fetch(
+        "SELECT 1 FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='users' AND COLUMN_NAME='role'",
+        (DB_CONFIG["database"],))
+    if not has_col:
+        db_exec("ALTER TABLE users ADD COLUMN role VARCHAR(16) NOT NULL DEFAULT 'user'")
 
 
 def hash_password(password):
@@ -249,40 +295,47 @@ def db_create_user(username, password, display_name=None):
 
 
 def db_verify_user(username, password):
-    """验证用户登录，成功返回 (True, username)，失败返回 (False, 错误信息)"""
+    """验证用户登录，成功返回 (True, username, role)，失败返回 (False, 错误信息)"""
     username = username.strip().lower()
     pw_hash = hash_password(password)
     rows = db_fetch(
-        "SELECT username, display_name FROM users WHERE username=%s AND password_hash=%s",
+        "SELECT username, display_name, role FROM users WHERE username=%s AND password_hash=%s",
         (username, pw_hash)
     )
     if rows:
-        return True, rows[0][0]
-    # 再查一下用户名是否存在（区分"密码错误"和"用户不存在"）
-    exists = db_fetch("SELECT 1 FROM users WHERE username=%s", (username,))
-    if exists:
-        return False, "密码错误"
-    return False, "用户不存在"
+        return True, rows[0][0], rows[0][2]  # (True, username, role)
+    # 统一错误消息，不区分"用户不存在"和"密码错误"（防止用户名枚举攻击）
+    return False, "用户名或密码错误", None
 
 
 def seed_default_users():
-    """初始化默认用户到数据库（用户已存在时跳过）"""
+    """初始化默认用户到数据库（用户已存在时跳过）。
+    返回实际创建成功的用户数（用于启动日志）"""
     defaults = [
-        ("admin", "admin123", "管理员"),
-        ("zhangsan", "123456", "张三"),
-        ("lisi", "123456", "李四"),
+        ("admin", "admin123", "管理员", "admin"),
+        ("zhangsan", "123456", "张三", "user"),
+        ("lisi", "123456", "李四", "user"),
     ]
-    for uname, pwd, dname in defaults:
+    created = 0
+    for uname, pwd, dname, role in defaults:
         rows = db_fetch("SELECT 1 FROM users WHERE username=%s", (uname,))
         if not rows:
             pw_hash = hash_password(pwd)
-            db_exec(
-                "INSERT INTO users (username, password_hash, display_name) VALUES (%s, %s, %s)",
-                (uname, pw_hash, dname)
+            ok = db_exec(
+                "INSERT INTO users (username, password_hash, display_name, role) VALUES (%s, %s, %s, %s)",
+                (uname, pw_hash, dname, role)
             )
-            print(f"  ✅ 默认用户已创建: {uname}")
+            if ok:
+                print(f"  ✅ 默认用户已创建: {uname} (角色: {role})")
+                created += 1
+            else:
+                print(f"  ⚠️ 默认用户 {uname} 创建失败（数据库不可用，请检查 MySQL 配置）")
         else:
+            # 用户已存在 → 确保角色正确（老用户可能没有role）
+            db_exec("UPDATE users SET role=%s WHERE username=%s AND role='user' AND %s='admin'",
+                    (role, uname, uname))
             print(f"  ⏭️ 用户已存在，跳过: {uname}")
+    return created
 
 
 # ====================== 智谱GLM4 配置 ======================
@@ -539,11 +592,55 @@ def web_search(query: str, max_results: int = 5) -> str:
         return f"❌ 联网搜索失败：{str(e)}"
 
 
+# ====================== URL 安全校验（防 SSRF） ======================
+import ipaddress
+from urllib.parse import urlparse
+
+_SAFE_DOMAINS = None  # None = 允许所有公共域名（拒绝内网IP）
+_BLOCKED_CIDRS = [
+    ipaddress.ip_network("127.0.0.0/8"),      # loopback
+    ipaddress.ip_network("10.0.0.0/8"),       # private A
+    ipaddress.ip_network("172.16.0.0/12"),    # private B
+    ipaddress.ip_network("192.168.0.0/16"),   # private C
+    ipaddress.ip_network("169.254.0.0/16"),   # link-local
+    ipaddress.ip_network("0.0.0.0/8"),        # current network
+    ipaddress.ip_network("::1/128"),          # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),         # IPv6 unique local
+    ipaddress.ip_network("fe80::/10"),        # IPv6 link-local
+]
+
+
+def _is_safe_url(url: str) -> bool:
+    """校验 URL 是否安全（拒绝内网地址，防 SSRF）"""
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        # 拒绝裸 IP 内网地址
+        try:
+            ip = ipaddress.ip_address(hostname)
+            for cidr in _BLOCKED_CIDRS:
+                if ip in cidr:
+                    return False
+        except ValueError:
+            pass  # 不是IP地址，是域名，允许
+        # 只允许 http/https
+        if parsed.scheme not in ("http", "https"):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 # ====================== 工具6：网页内容抓取 ======================
 @tool
 def web_fetch(url: str) -> str:
     """当用户提供URL链接并要求阅读、总结、分析网页内容时，使用此工具抓取并总结网页内容。
     参数：url - 要抓取的网页完整URL地址"""
+    # SSRF 防护：拒绝内网地址和非 HTTP(S) 协议
+    if not _is_safe_url(url):
+        return "❌ 安全限制：不允许访问内网地址或不支持的协议，仅支持公网 HTTP/HTTPS 链接。"
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -623,6 +720,32 @@ def send_email_tool(subject: str, content: str) -> str:
         return f"❌ 邮件发送失败：{str(e)}"
 
 
+# ====================== SQL 安全校验 ======================
+# 仅允许操作的表（防止误操作 users / chat_messages / chat_sessions 等核心表）
+_ALLOWED_TABLES = {"students", "scores"}
+# 禁止的 SQL 关键字（防止 DROP/ALTER/TRUNCATE 等破坏性操作）
+_BLOCKED_SQL_KEYWORDS = [
+    "DROP", "ALTER", "TRUNCATE", "CREATE", "RENAME",
+    "GRANT", "REVOKE", "EXEC", "EXECUTE", "CALL",
+    "LOAD", "INTO OUTFILE", "INTO DUMPFILE", "SHUTDOWN",
+]
+# 允许的操作类型（即使是 SELECT/INSERT/UPDATE/DELETE，也只能操作白名单中的表）
+_ALLOWED_OPERATIONS = ("SELECT", "INSERT", "UPDATE", "DELETE")
+
+
+def _validate_sql(sql: str) -> tuple:
+    """校验 SQL 是否安全，返回 (is_safe: bool, reason: str)"""
+    sql_upper = sql.upper().strip()
+    # 1. 检查是否以允许的操作开头
+    if not any(sql_upper.startswith(op) for op in _ALLOWED_OPERATIONS):
+        return False, f"仅允许 SELECT/INSERT/UPDATE/DELETE 操作，收到: {sql_upper.split()[0] if sql_upper else '空'}"
+    # 2. 检查是否包含禁止的关键字
+    for kw in _BLOCKED_SQL_KEYWORDS:
+        if kw in sql_upper:
+            return False, f"禁止使用 {kw} 操作"
+    return True, ""
+
+
 # ====================== 工具4：数据库操作 ======================
 @tool
 def execute_sql_query(query: str) -> str:
@@ -685,9 +808,15 @@ def execute_sql_query(query: str) -> str:
         if sql_match:
             sql = sql_match.group(0).strip()
 
-        # 最终校验
+        # 最终校验：操作类型
         if not sql or not sql.upper().startswith(("SELECT", "INSERT", "UPDATE", "DELETE")):
             return "错误：无法生成合法的SQL语句，请重新描述您的问题。"
+
+        # 安全检查：禁止危险操作
+        is_safe, reason = _validate_sql(sql)
+        if not is_safe:
+            print(f"[SQL安全拦截] {reason}: {sql}")
+            return f"❌ 操作被安全策略拦截：{reason}"
 
         print(f"[生成SQL] {sql}")
         result = query_db(sql)
@@ -963,7 +1092,7 @@ def add_user_message(user_input, image, camera_image, chat_history):
     return "", None, None, chat_history, pending
 
 
-def bot_respond(pending, chat_history, session_id="default", username="public"):
+def bot_respond(pending, chat_history, session_id="default", user_state=None):
     """
     第二步（耗时，生成器）：识图、路由、流式调用Agent生成回复并持久化。
     每收到一段文字就 yield 一次，实现打字机效果。
@@ -972,6 +1101,7 @@ def bot_respond(pending, chat_history, session_id="default", username="public"):
         yield chat_history, session_id, gr.skip(), None
         return
 
+    username = _uname(user_state) or "public"
     user_input = pending["text"]
     img_path = pending.get("img_path")
 
@@ -1073,8 +1203,8 @@ YOLO对图片的识别结果为：{yolo_result}
         else:
             # ---- 快速通道：直接web_search + 流式总结 ----
             # 清理口语化前缀，提取干净的搜索关键词（避免把"帮我搜一下"当搜索词）
-            import re as _re
-            clean_query = _re.sub(
+            import re
+            clean_query = re.sub(
                 r'^(帮我|请(你)?|麻烦)?(搜一下|搜索一下|搜索|查一下|查一查|查查|查|上网搜一下|上网查一下|联网搜索|联网搜一下)',
                 '', user_input).strip()
             if not clean_query:
@@ -1253,8 +1383,9 @@ SIDEBAR_CSS = """
 """
 
 
-def refresh_session_dropdown(username="public", current_sid=None):
+def refresh_session_dropdown(user_state=None, current_sid=None):
     """刷新会话下拉列表，返回 gr.update() 供回调输出到 session_dropdown"""
+    username = _uname(user_state) or "public"
     sessions = db_list_sessions(username)
     today = datetime.date.today()
     yesterday = today - datetime.timedelta(days=1)
@@ -1276,6 +1407,17 @@ def refresh_session_dropdown(username="public", current_sid=None):
     return gr.update(choices=choices, value=value)
 
 
+# ====================== user_state 工具函数 ======================
+def _uname(user_state):
+    """从 user_state 中提取用户名（兼容旧版字符串和元组格式）"""
+    return user_state[0] if isinstance(user_state, (list, tuple)) else user_state
+
+
+def _role(user_state):
+    """从 user_state 中提取角色"""
+    return user_state[1] if isinstance(user_state, (list, tuple)) and len(user_state) > 1 else "user"
+
+
 # ====================== 会话管理回调 ======================
 def init_ui():
     """页面加载时初始化：建表，返回空白状态（用户未登录时等待登录）"""
@@ -1284,8 +1426,9 @@ def init_ui():
     return gr.update(choices=[]), [], "default", None
 
 
-def on_new_session(username):
+def on_new_session(user_state):
     """开启新对话（标题先叫"新对话"，第一轮对话后由LLM总结生成）"""
+    username = _uname(user_state) or "public"
     now = datetime.datetime.now()
     sid = f"s{now.strftime('%Y%m%d%H%M%S')}"
     db_ensure_session(sid, "新对话", username)
@@ -1335,7 +1478,7 @@ def start_rename():
     return gr.Textbox(visible=True), None, gr.Button(value="🗑️ 删除", variant="secondary")
 
 
-def do_rename_session(new_name, sid, username):
+def do_rename_session(new_name, sid, user_state):
     """执行重命名并刷新下拉列表"""
     if not sid:
         return gr.Textbox(visible=False, value=""), gr.skip()
@@ -1343,14 +1486,15 @@ def do_rename_session(new_name, sid, username):
     if new_name:
         db_rename_session(sid, new_name)
         print(f"✏️ 会话 {sid} 重命名为: {new_name}")
-    dropdown_update = refresh_session_dropdown(username, sid)
+    dropdown_update = refresh_session_dropdown(user_state, sid)
     return gr.Textbox(visible=False, value=""), dropdown_update
 
 
-def on_delete_click(sid, username, pending):
+def on_delete_click(sid, user_state, pending):
     """删除当前选中的会话（二次确认：第一次改按钮文字，第二次执行删除）"""
     if not sid:
         return gr.skip(), gr.skip(), gr.skip(), gr.skip(), None
+    username = _uname(user_state) or "public"
     if not pending:
         # 第一次点击 → 要求确认
         return (gr.skip(), gr.skip(), gr.skip(),
@@ -1360,7 +1504,7 @@ def on_delete_click(sid, username, pending):
     print(f"🗑️ 已删除会话: {sid}")
     default_sid = f"default-{username}"
     db_ensure_session(default_sid, "默认会话", username)
-    dropdown_update = refresh_session_dropdown(username, default_sid)
+    dropdown_update = refresh_session_dropdown(user_state, default_sid)
     history = db_load_messages(default_sid)
     return (history, default_sid, dropdown_update,
             gr.Button(value="🗑️ 删除", variant="secondary"), None)
@@ -1378,6 +1522,95 @@ def get_local_ip():
         return "127.0.0.1"
 
 
+# ====================== 登录频率限制（防暴力破解） ======================
+import time as _time
+_login_attempts = {}  # {ip_or_username: [(timestamp, success), ...]}
+_MAX_ATTEMPTS = 10      # 窗口内最多尝试次数
+_ATTEMPT_WINDOW = 300   # 时间窗口（秒）
+
+
+def _check_rate_limit(key):
+    """检查登录频率，返回 (是否允许, 剩余秒数)"""
+    now = _time.time()
+    attempts = _login_attempts.get(key, [])
+    # 清理过期的尝试记录
+    attempts = [a for a in attempts if now - a[0] < _ATTEMPT_WINDOW]
+    _login_attempts[key] = attempts
+    if len(attempts) >= _MAX_ATTEMPTS:
+        wait = int(_ATTEMPT_WINDOW - (now - attempts[0][0]))
+        return False, max(0, wait)
+    return True, 0
+
+
+def _record_attempt(key, success):
+    """记录一次登录尝试"""
+    now = _time.time()
+    attempts = _login_attempts.get(key, [])
+    attempts = [a for a in attempts if now - a[0] < _ATTEMPT_WINDOW]
+    attempts.append((now, success))
+    _login_attempts[key] = attempts
+
+
+# ====================== 修改密码 ======================
+def db_change_password(username, old_password, new_password):
+    """修改用户密码，返回 (success: bool, message: str)"""
+    username = username.strip().lower() if isinstance(username, str) else username
+    # 验证旧密码
+    pw_hash = hash_password(old_password)
+    rows = db_fetch(
+        "SELECT 1 FROM users WHERE username=%s AND password_hash=%s",
+        (username, pw_hash)
+    )
+    if not rows:
+        return False, "原密码错误"
+    if not new_password or len(new_password) < 4:
+        return False, "新密码至少4个字符"
+    new_hash = hash_password(new_password)
+    ok = db_exec(
+        "UPDATE users SET password_hash=%s WHERE username=%s",
+        (new_hash, username)
+    )
+    return (True, "密码修改成功") if ok else (False, "数据库操作失败，请稍后重试")
+
+
+# ====================== 管理员功能 ======================
+def admin_list_users():
+    """管理员查看所有用户列表"""
+    rows = db_fetch("SELECT id, username, display_name, role, created_at FROM users ORDER BY id")
+    if not rows:
+        return "暂无用户数据"
+    lines = ["| ID | 用户名 | 显示名 | 角色 | 创建时间 |",
+             "|----|--------|--------|------|----------|"]
+    for r in rows:
+        lines.append(f"| {r[0]} | {r[1]} | {r[3] or '-'} | {r[4]} | {str(r[4])[:19]} |")
+    return "\n".join(lines)
+
+
+def admin_delete_user(target_username):
+    """管理员删除用户（不能删除自己，不能删除其他admin）"""
+    target = target_username.strip().lower()
+    if target == "admin":
+        return "❌ 不能删除内置 admin 账号"
+    # 检查目标角色
+    rows = db_fetch("SELECT role FROM users WHERE username=%s", (target,))
+    if not rows:
+        return f"❌ 用户 '{target}' 不存在"
+    if rows[0][0] == "admin":
+        return "❌ 不能删除其他管理员账号"
+    db_exec("DELETE FROM chat_messages WHERE session_id IN "
+            "(SELECT session_id FROM chat_sessions WHERE username=%s)", (target,))
+    db_exec("DELETE FROM chat_sessions WHERE username=%s", (target,))
+    db_exec("DELETE FROM users WHERE username=%s", (target,))
+    return f"✅ 用户 '{target}' 及其聊天数据已删除"
+
+
+def admin_promote_user(target_username):
+    """管理员提升用户为管理员"""
+    target = target_username.strip().lower()
+    ok = db_exec("UPDATE users SET role='admin' WHERE username=%s", (target,))
+    return f"✅ 用户 '{target}' 已提升为管理员" if ok else f"❌ 操作失败"
+
+
 # ====================== 登录/注册/登出回调 ======================
 def do_login(username, password):
     """登录校验：查MySQL users表，成功则显示主应用并初始化用户会话"""
@@ -1388,7 +1621,15 @@ def do_login(username, password):
         return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
                 "⚠️ 请输入密码")
 
-    success, result = db_verify_user(username, password)
+    # 频率限制检查
+    key = username.strip().lower()
+    allowed, wait = _check_rate_limit(key)
+    if not allowed:
+        return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+                f"⏳ 登录尝试过于频繁，请 {wait} 秒后再试")
+
+    success, result, role = db_verify_user(username, password)
+    _record_attempt(key, success)
     if not success:
         # result 是错误信息
         return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
@@ -1401,11 +1642,11 @@ def do_login(username, password):
     db_ensure_session(default_sid, "默认会话", uname)
     dropdown_update = refresh_session_dropdown(uname, default_sid)
     history = db_load_messages(default_sid)
-    print(f"✅ 用户登录成功: {uname}")
+    print(f"✅ 用户登录成功: {uname} (角色: {role})")
 
     return (gr.update(visible=False),          # login_col 隐藏
             gr.update(visible=True),           # main_col 显示
-            uname,                             # user_state
+            (uname, role),                     # user_state = (username, role)
             dropdown_update,                   # session_dropdown
             history,                           # chatbot
             default_sid,                       # session_state
@@ -1437,15 +1678,16 @@ def do_register(username, password):
 
     return (gr.update(visible=False),          # login_col 隐藏
             gr.update(visible=True),           # main_col 显示
-            uname,                             # user_state
+            (uname, "user"),                   # user_state = (username, role)
             dropdown_update,                   # session_dropdown
             history,                           # chatbot
             default_sid,                       # session_state
             "")                                # 清空错误提示
 
 
-def do_logout(username):
+def do_logout(user_state):
     """退出登录：隐藏主应用，显示登录页，清空状态"""
+    username = _uname(user_state) or "unknown"
     print(f"🚪 用户登出: {username}")
     return (gr.update(visible=True),           # login_col 显示
             gr.update(visible=False),          # main_col 隐藏
@@ -1554,6 +1796,23 @@ with gr.Blocks(title="智慧校园系统") as demo:
             )
 
             clear_btn = gr.Button("🧹 清空当前会话聊天记录", variant="secondary", size="sm")
+
+            # ---- 修改密码 ----
+            with gr.Accordion("🔒 修改密码", open=False):
+                pwd_old = gr.Textbox(label="原密码", type="password", placeholder="输入原密码")
+                pwd_new = gr.Textbox(label="新密码", type="password", placeholder="至少4个字符")
+                pwd_btn = gr.Button("✅ 确认修改", variant="secondary", size="sm")
+                pwd_msg = gr.Markdown("", visible=True)
+
+            # ---- 管理员面板 ----
+            with gr.Accordion("🛡️ 管理员面板", open=False, visible=True) as admin_panel:
+                gr.Markdown("仅管理员可操作")
+                admin_user_input = gr.Textbox(label="目标用户名", placeholder="输入要操作的用户名")
+                with gr.Row():
+                    admin_list_btn = gr.Button("📋 查看用户列表", size="sm")
+                    admin_delete_btn = gr.Button("🗑️ 删除用户", size="sm", variant="stop")
+                    admin_promote_btn = gr.Button("⬆️ 提升为管理员", size="sm")
+                admin_result = gr.Markdown("")
 
             logout_btn = gr.Button("🚪 退出登录（切换用户）", variant="stop", size="sm")
 
@@ -1678,6 +1937,60 @@ with gr.Blocks(title="智慧校园系统") as demo:
             inputs=[user_state],
             outputs=[login_col, main_col, user_state, session_dropdown, chatbot, session_state,
                      login_username, login_password, login_error]
+        )
+
+        # ---- 修改密码回调 ----
+        def _change_password(user_state_val, old_pwd, new_pwd):
+            uname = _uname(user_state_val)
+            if not uname:
+                return "❌ 请先登录"
+            if not old_pwd or not new_pwd:
+                return "⚠️ 请填写原密码和新密码"
+            ok, msg = db_change_password(uname, old_pwd, new_pwd)
+            if ok:
+                return f"✅ {msg}"
+            return f"❌ {msg}"
+
+        pwd_btn.click(
+            fn=_change_password,
+            inputs=[user_state, pwd_old, pwd_new],
+            outputs=[pwd_msg]
+        )
+
+        # ---- 管理员回调 ----
+        def _admin_list_users(user_state_val):
+            if _role(user_state_val) != "admin":
+                return "❌ 权限不足：仅管理员可执行此操作"
+            return admin_list_users()
+
+        def _admin_delete_user(user_state_val, target):
+            if _role(user_state_val) != "admin":
+                return "❌ 权限不足：仅管理员可执行此操作"
+            if not target or not target.strip():
+                return "⚠️ 请输入要删除的用户名"
+            return admin_delete_user(target)
+
+        def _admin_promote_user(user_state_val, target):
+            if _role(user_state_val) != "admin":
+                return "❌ 权限不足：仅管理员可执行此操作"
+            if not target or not target.strip():
+                return "⚠️ 请输入要提升的用户名"
+            return admin_promote_user(target)
+
+        admin_list_btn.click(
+            fn=_admin_list_users,
+            inputs=[user_state],
+            outputs=[admin_result]
+        )
+        admin_delete_btn.click(
+            fn=_admin_delete_user,
+            inputs=[user_state, admin_user_input],
+            outputs=[admin_result]
+        )
+        admin_promote_btn.click(
+            fn=_admin_promote_user,
+            inputs=[user_state, admin_user_input],
+            outputs=[admin_result]
         )
 
         gr.Examples(
@@ -1828,15 +2141,23 @@ if __name__ == "__main__":
             quiet=False
         )
     except OSError as e:
-        if "Address already in use" in str(e):
-            print("\n⚠️ 端口7860已被占用，尝试使用7861端口...")
-            demo.launch(
-                server_name="127.0.0.1",
-                server_port=7861,
-                share=False,
-                debug=False,
-                theme=gr.themes.Soft(),
-                css=SIDEBAR_CSS
-            )
+        if "Address already in use" in str(e) or "Cannot find empty port" in str(e):
+            # 自动递增端口号，最多尝试 20 个端口
+            for port in range(7861, 7881):
+                try:
+                    print(f"\n⚠️ 端口已被占用，尝试使用 {port} 端口...")
+                    demo.launch(
+                        server_name="127.0.0.1",
+                        server_port=port,
+                        share=False,
+                        debug=False,
+                        theme=gr.themes.Soft(),
+                        css=SIDEBAR_CSS
+                    )
+                    break
+                except OSError:
+                    continue
+            else:
+                raise RuntimeError("无法找到可用端口（已尝试 7860-7880），请手动释放端口后重试。")
         else:
             raise e
