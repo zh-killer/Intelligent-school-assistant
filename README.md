@@ -77,7 +77,7 @@ CREATE DATABASE IF NOT EXISTS db_demo DEFAULT CHARSET utf8mb4;
 
 ### 4. 启动
 ```bash
-python "07、06版加上数据库.py"
+python "智能校园助手ai.py"
 ```
 浏览器访问 **http://localhost:7860**，使用内置测试账号登录：
 - `admin` / `admin123`
@@ -142,7 +142,7 @@ python "07、06版加上数据库.py"
 
 | 文件 | 说明 |
 |------|------|
-| `07、06版加上数据库.py` | 主程序（全部功能集成在这一个文件） |
+| `智能校园助手ai.py` | 主程序（全部功能集成在这一个文件） |
 | `.env.example` | 环境变量配置模板 |
 | `01-09` 系列文件 | 开发过程中的迭代版本 |
 
