@@ -1,0 +1,8 @@
+# 单测需要的最小依赖。
+#
+# 不用 requirements.txt：那里面 gradio / langchain / pymysql / opencv 全是为运行准备的，
+# 而单测只覆盖 security.py（SQL 白名单、SSRF）和 utils.py（密码哈希），
+# 装上这三个包就能跑，CI 十几秒结束。
+pytest>=8.0,<9.0
+pillow>=10.0,<13.0
+python-dotenv>=1.0,<2.0

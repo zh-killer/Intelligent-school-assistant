@@ -1,5 +1,7 @@
 # 🏫 智慧校园 AI 智能体
 
+[![tests](https://github.com/zh-killer/Intelligent-school-assistant/actions/workflows/tests.yml/badge.svg)](https://github.com/zh-killer/Intelligent-school-assistant/actions/workflows/tests.yml)
+
 > 基于 **LangChain + 智谱 GLM-4** 的校园 AI 助手：Gradio 6 界面、MySQL 持久化、6 个工具、GLM-4V + YOLO 双引擎视觉、Whisper 语音交互。
 
 📄 相关文档：[项目全景图](项目全景图.md)（按 STAR 写的项目介绍，可直接用于简历）· [从零到上线：服务器部署全流程](从零到上线-部署全流程.md)
