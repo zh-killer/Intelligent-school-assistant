@@ -1,18 +1,66 @@
 # ====================== 工具函数 ======================
-import hashlib
-import socket
 import base64
-import uuid
+import hashlib
+import hmac
 import os
+import socket
+import uuid
 from io import BytesIO
+
 from PIL import Image
+
 import config
 
 
+# ====================== 密码哈希 ======================
+# PBKDF2-HMAC-SHA256 + 每用户随机盐。早期版本用的是 SHA256 + 固定盐，
+# 固定盐等于全库共用一张彩虹表，所以这里保留对老哈希的校验能力，
+# 老用户下次登录成功时由 database.db_verify_user 自动升级成新格式。
+_PBKDF2_ITERATIONS = 200_000
+_LEGACY_SALT = "smart_campus_2024_salt"
+_PBKDF2_PREFIX = "pbkdf2_sha256"
+
+
 def hash_password(password):
-    """SHA256 + 固定盐 密码哈希（演示级别安全，生产环境请用 bcrypt）"""
-    salt = "smart_campus_2024_salt"
-    return hashlib.sha256((password + salt).encode()).hexdigest()
+    """生成 PBKDF2 密码哈希，格式：pbkdf2_sha256$迭代次数$盐$摘要"""
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS
+    )
+    return "{}${}${}${}".format(
+        _PBKDF2_PREFIX,
+        _PBKDF2_ITERATIONS,
+        base64.b64encode(salt).decode("ascii"),
+        base64.b64encode(digest).decode("ascii"),
+    )
+
+
+def _legacy_hash(password):
+    """早期版本的哈希：SHA256 + 固定盐（仅用于校验存量数据）"""
+    return hashlib.sha256((password + _LEGACY_SALT).encode("utf-8")).hexdigest()
+
+
+def verify_password(password, stored):
+    """校验密码，同时兼容旧的 SHA256 哈希与新的 PBKDF2 哈希"""
+    if not password or not stored:
+        return False
+    if stored.startswith(_PBKDF2_PREFIX + "$"):
+        try:
+            _, iterations, salt_b64, digest_b64 = stored.split("$")
+            salt = base64.b64decode(salt_b64)
+            expected = base64.b64decode(digest_b64)
+            actual = hashlib.pbkdf2_hmac(
+                "sha256", password.encode("utf-8"), salt, int(iterations)
+            )
+        except (ValueError, TypeError):
+            return False
+        return hmac.compare_digest(actual, expected)
+    return hmac.compare_digest(_legacy_hash(password), stored)
+
+
+def needs_rehash(stored):
+    """存量的老哈希需要在下一次登录成功后升级"""
+    return not (stored or "").startswith(_PBKDF2_PREFIX + "$")
 
 
 def _uname(user_state):

@@ -225,30 +225,40 @@ def db_create_user(username, password, display_name=None):
 
 
 def db_verify_user(username, password):
-    """验证用户登录，成功返回 (True, username, role)，失败返回 (False, 错误信息, None)"""
+    """验证用户登录，成功返回 (True, username, role)，失败返回 (False, 错误信息, None)
+
+    密码不再参与 SQL 比较：先按用户名取出哈希，再在 Python 里用
+    utils.verify_password 校验（兼容旧的固定盐 SHA256），
+    老哈希在校验通过后顺手升级成 PBKDF2。
+    """
     import utils
     username = username.strip().lower()
-    pw_hash = utils.hash_password(password)
     rows = db_fetch(
-        "SELECT username, display_name, role FROM users WHERE username=%s AND password_hash=%s",
-        (username, pw_hash)
+        "SELECT username, display_name, role, password_hash FROM users WHERE username=%s",
+        (username,)
     )
-    if rows:
-        return True, rows[0][0], rows[0][2]
-    # 统一错误消息，不区分"用户不存在"和"密码错误"（防止用户名枚举攻击）
-    return False, "用户名或密码错误", None
+    if not rows:
+        # 统一错误消息，不区分"用户不存在"和"密码错误"（防止用户名枚举攻击）
+        return False, "用户名或密码错误", None
+
+    name, _display_name, role, stored_hash = rows[0]
+    if not utils.verify_password(password, stored_hash):
+        return False, "用户名或密码错误", None
+
+    if utils.needs_rehash(stored_hash):
+        db_exec(
+            "UPDATE users SET password_hash=%s WHERE username=%s",
+            (utils.hash_password(password), name)
+        )
+    return True, name, role
 
 
 def db_change_password(username, old_password, new_password):
     """修改用户密码，返回 (success: bool, message: str)"""
     import utils
     username = username.strip().lower() if isinstance(username, str) else username
-    pw_hash = utils.hash_password(old_password)
-    rows = db_fetch(
-        "SELECT 1 FROM users WHERE username=%s AND password_hash=%s",
-        (username, pw_hash)
-    )
-    if not rows:
+    rows = db_fetch("SELECT password_hash FROM users WHERE username=%s", (username,))
+    if not rows or not utils.verify_password(old_password, rows[0][0]):
         return False, "原密码错误"
     if not new_password or len(new_password) < 4:
         return False, "新密码至少4个字符"

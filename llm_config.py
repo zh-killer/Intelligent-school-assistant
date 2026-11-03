@@ -8,15 +8,25 @@ from langgraph.checkpoint.memory import InMemorySaver
 import config
 
 # 智谱GLM4 配置
+# .env 里写的是小写 zhipuai_api_key；macOS / Linux 的环境变量区分大小写，
+# 所以这里两种写法都取，避免换了系统就报 “api_key is required”。
+_API_KEY = (os.getenv("zhipuai_api_key") or os.getenv("ZHIPUAI_API_KEY") or "").strip()
+_BASE_URL = os.getenv("zhipuai_base_url") or "https://open.bigmodel.cn/api/paas/v4"
+
+if not _API_KEY:
+    # 没有 Key 不应该是「导入即崩」：留一个占位值让界面能起来，
+    # 由 utils.check_config() 在启动时提示具体缺什么。
+    print("[配置] 未检测到 zhipuai_api_key：AI 对话 / 联网搜索 / 图像识别不可用")
+
 llm = ChatOpenAI(
     model="glm-4",
-    api_key=os.getenv("zhipuai_api_key"),
-    base_url=os.getenv("zhipuai_base_url"),
+    api_key=_API_KEY or "not-configured",
+    base_url=_BASE_URL,
     temperature=0.1,
     timeout=30,
 )
 
-client = ZhipuAI()
+client = ZhipuAI(api_key=_API_KEY or "not-configured")
 
 # 创建全局检查点保存器（用于记忆功能）
 checkpointer = InMemorySaver()

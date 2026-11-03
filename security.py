@@ -1,4 +1,9 @@
 # ====================== 安全层 ======================
+"""三道防线：SSRF 拦截（网页抓取）、SQL 白名单（自然语言转 SQL）、登录限速。
+
+这里的校验都是为了兜住「模型生成的东西不能直接执行」：
+LLM 输出只是字符串，执行前必须过一遍确定性规则。
+"""
 import ipaddress
 import time as _time
 import re
@@ -50,17 +55,51 @@ _BLOCKED_SQL_KEYWORDS = [
 ]
 _ALLOWED_OPERATIONS = ("SELECT", "INSERT", "UPDATE", "DELETE")
 
+# FROM / JOIN / INTO / UPDATE 后面跟的表名（允许反引号）
+_TABLE_RE = re.compile(
+    r"\b(?:FROM|JOIN|INTO|UPDATE)\s+`?([A-Za-z_][A-Za-z0-9_]*)`?", re.IGNORECASE
+)
+
+
+def _tables_in(sql: str) -> set:
+    return {match.group(1).lower() for match in _TABLE_RE.finditer(sql)}
+
 
 def _validate_sql(sql: str) -> tuple:
-    """校验 SQL 是否安全，返回 (is_safe: bool, reason: str)"""
-    sql_upper = sql.upper().strip()
-    # 1. 检查是否以允许的操作开头
-    if not any(sql_upper.startswith(op) for op in _ALLOWED_OPERATIONS):
-        return False, f"仅允许 SELECT/INSERT/UPDATE/DELETE 操作，收到: {sql_upper.split()[0] if sql_upper else '空'}"
-    # 2. 检查是否包含禁止的关键字
-    for kw in _BLOCKED_SQL_KEYWORDS:
-        if kw in sql_upper:
-            return False, f"禁止使用 {kw} 操作"
+    """校验模型生成的 SQL，返回 (is_safe: bool, reason: str)
+
+    规则（任一条不满足就拒绝）：
+    1. 单条语句，且以 SELECT / INSERT / UPDATE / DELETE 开头；
+    2. 不含 DDL、权限、文件读写这类关键字；
+    3. 只操作白名单里的表（students / scores）；
+    4. UPDATE / DELETE 必须带 WHERE —— 否则一条语句就能清空整张表。
+
+    这是「确定性规则兜底」，不是完整的 SQL 解析器：字符串字面量里出现关键字
+    会被误判（比如 WHERE name = 'drop'），但对校园演示库来说，宁可误杀不可放过。
+    """
+    text = (sql or "").strip()
+    if not text:
+        return False, "SQL 为空"
+
+    if ";" in text.rstrip(";"):
+        return False, "禁止一次执行多条语句"
+
+    upper = text.upper()
+    if not any(upper.startswith(op) for op in _ALLOWED_OPERATIONS):
+        head = upper.split()[0] if upper.split() else "空"
+        return False, f"仅允许 SELECT/INSERT/UPDATE/DELETE，收到：{head}"
+
+    for keyword in _BLOCKED_SQL_KEYWORDS:
+        if keyword in upper:
+            return False, f"禁止使用 {keyword} 操作"
+
+    unknown = _tables_in(text) - _ALLOWED_TABLES
+    if unknown:
+        return False, f"只允许查询 {sorted(_ALLOWED_TABLES)}，收到：{sorted(unknown)}"
+
+    if upper.startswith(("UPDATE", "DELETE")) and not re.search(r"\bWHERE\b", upper):
+        return False, "UPDATE / DELETE 必须带 WHERE 条件"
+
     return True, ""
 
 

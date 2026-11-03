@@ -1,7 +1,6 @@
 # ====================== 环境初始化 ======================
 import os
 import sys
-import io
 
 # 自动加载 .env 文件（优先级高于系统环境变量）
 try:
@@ -14,9 +13,15 @@ except ImportError:
     pass  # python-dotenv 未安装时忽略，用户可以手动设环境变量
 
 # 修复 Windows GBK 终端打印 emoji 崩溃的问题
+# 用 reconfigure 就地调整编码，而不是重新包一层 TextIOWrapper：
+# 替换 sys.stdout 会把 pytest / IDE / 日志库捕获的输出流换掉，导致
+# 「I/O operation on closed file」之类的报错。
 if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass  # 被重定向到不支持 reconfigure 的对象时忽略
 
 # ====================== 数据库配置 ======================
 DB_CONFIG = {
